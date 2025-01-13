@@ -1,0 +1,129 @@
+# Define variables
+$server = "0.0.0.0" # Replace with your Zabbix server's address
+$hostname = $env:COMPUTERNAME # Automatically retrieve the hostname
+$pskFilePathAgent = "C:\Program Files\Zabbix Agent 2\zabbix_agent2.psk"
+
+# Create the necessary directories
+New-Item -ItemType Directory -Force -Path "C:\Program Files\Zabbix Agent 2" | Out-Null
+
+# Generate a 256-bit (32-byte) random PSK in hexadecimal format
+$psk = -join ((1..32) | ForEach-Object { "{0:X2}" -f (Get-Random -Minimum 0 -Maximum 256) })
+
+# Save the PSK to the agent installation folder
+Set-Content -Path $pskFilePathAgent -Value $psk -Force
+
+# Secure the PSK file permissions (restrict access to SYSTEM and Administrators only)
+icacls $pskFilePathAgent /inheritance:r /grant:r "SYSTEM:F" "Domain Admins:F" "ALL APPLICATION PACKAGES:F" | Out-Null
+
+# Display PSK generation details (optional for debugging or logging)
+Write-Output "Generated PSK for ${hostname}:"
+Write-Output $psk
+Write-Output "PSK saved to:"
+Write-Output $pskFilePathAgent
+
+# Install Zabbix Agent 2 silently
+$msiPath = "C:\Zabbix\zabbix_agent2-7.2.0-windows-amd64-openssl.msi" # Replace with Agent MSI extraction location
+
+# Define the arguments for the MSI installation
+$msiArgs = @(
+    "/i", "`"$msiPath`"",  # Properly quote the path to the MSI file
+    "/quiet",              # Silent installation
+    "/norestart",          # Prevent automatic restart
+    "SERVER=$server",      # Zabbix server
+    "SERVERACTIVE=$server", # Active Zabbix server
+    "HOSTNAME=$hostname",  # Hostname for Zabbix
+    "TLSCONNECT=psk",      # Use PSK for TLS
+    "TLSACCEPT=psk",       # Accept PSK for TLS
+    "TLSPSKIDENTITY=$hostname-PSK", # PSK identity
+    "TLSPSKFILE=`"$pskFilePathAgent`"" # Properly quote the PSK file path
+)
+
+# Join the arguments into a single string for execution
+$msiArgsString = $msiArgs -join " "
+
+# For debugging, output the full msiexec command being run
+Write-Host "Executing command: msiexec.exe $msiArgsString"
+
+# Try to run msiexec with elevated permissions (Run as Administrator)
+Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArgsString -NoNewWindow -Wait -PassThru
+
+# Check if the installation has been successful
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "Installation completed successfully" -ForegroundColor Green
+} else {
+    Write-Host "Installation failed with exit code: $LASTEXITCODE" -ForegroundColor Red
+}
+
+# Confirm installation success (optional)
+Write-Output "Zabbix Agent 2 installation completed for ${hostname}"
+Write-Output "PSK integration configured successfully."
+
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+# Zabbix API URL
+$zabbixURL = "<Zabbix_API_URL>/api_jsonrpc.php"  # Replace with your Zabbix URL
+$authToken = "<Your_API_Key>"  # Replace with your actual API key
+
+# Host-specific variables
+$server = $env:COMPUTERNAME  # Automatically gets the local computer name
+$dnsName = "$server.domain.local"  # DNS name
+$pskFilePath = "C:\Program Files\Zabbix Agent 2\zabbix_agent2.psk"  # Path to the local PSK file
+$templateID = "10081"  # Template ID to assign (replace this with your actual template ID)
+
+# Read the PSK file from the specified path
+if (Test-Path -Path $pskFilePath) {
+    Write-Host "Found PSK file at $pskFilePath."
+    $pskContent = (Get-Content -Path $pskFilePath -Raw).Trim()  # Read and trim the PSK content
+    Write-Host "PSK Content: $pskContent"
+} else {
+    Write-Error "PSK file not found at $pskFilePath. Ensure the Zabbix agent is installed and configured properly."
+    exit
+}
+
+# Construct the request body to add the host to Zabbix
+$addHostRequest = @{
+    jsonrpc = "2.0"
+    method = "host.create"
+    params = @{
+        host = $server.Trim()  # Use $server directly for the hostname
+        groups = @(@{ groupid = "6" })  # Group ID
+        interfaces = @(@{
+            type = 1
+            ip = ""                # Empty since we are using DNS
+            dns = $dnsName         # DNS name of the host
+            port = "10050"         # Agent port
+            useip = 0              # Use DNS, not IP
+            main = 1               # Main interface
+        })
+        templates = @(@{ templateid = $templateID })  # Assign template
+        tls_accept = 2                      # Accept PSK
+        tls_connect = 2                     # Use PSK encryption
+        tls_psk_identity = "$server-PSK"    # PSK identity
+        tls_psk = $pskContent               # Actual PSK content
+    }
+    id = 1
+}
+
+# Debugging: Print the request body before sending
+Write-Host "Request Body: $($addHostRequest | ConvertTo-Json -Depth 3)"
+
+try {
+    # Send the request to add the host to Zabbix
+    $headers = @{
+        "Authorization" = "Bearer $authToken"
+    }
+
+    $addHostResponse = Invoke-RestMethod -Uri $zabbixURL -Method Post -Body ($addHostRequest | ConvertTo-Json -Depth 3) -ContentType "application/json" -Headers $headers -Verbose
+
+    Write-Host "Zabbix Response: $($addHostResponse | ConvertTo-Json -Depth 3)"
+
+    if ($addHostResponse.result) {
+        Write-Host "Host $server added successfully to Zabbix." -ForegroundColor Green
+    } else {
+        Write-Error "Failed to add host $server. Error: $($addHostResponse.error.message)"
+    }
+} catch {
+    Write-Error "Failed to send the request to Zabbix for host $server. Error: $_"
+}
+
+Write-Host "Script completed." -ForegroundColor Cyan
